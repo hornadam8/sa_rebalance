@@ -1,0 +1,4 @@
+# Tickers Schwab won't let us trade via the API (broker-call required, restricted, etc.).
+# One ticker per line. Comments start with '#'. The execute step appends to this file
+# automatically when an order is rejected.
+SHIP
