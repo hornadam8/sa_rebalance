@@ -53,7 +53,7 @@ fn filter_body() -> serde_json::Value {
     })
 }
 
-pub async fn fetch_top_rated(sa_cookie: &str) -> Result<Vec<Ticker>> {
+pub async fn fetch_top_rated(sa_cookie: &str) -> Result<(Vec<Ticker>, String)> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .build()
@@ -73,13 +73,15 @@ pub async fn fetch_top_rated(sa_cookie: &str) -> Result<Vec<Ticker>> {
         .context("sending SA screener request")?;
 
     let status = resp.status();
+    let updated_cookies = merge_set_cookies(sa_cookie, resp.headers());
+
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("SA screener returned {}: {}", status, body);
     }
 
     let parsed: ScreenerResponse = resp.json().await.context("parsing SA response")?;
-    Ok(parsed
+    let tickers = parsed
         .data
         .into_iter()
         .map(|item| Ticker {
@@ -87,5 +89,30 @@ pub async fn fetch_top_rated(sa_cookie: &str) -> Result<Vec<Ticker>> {
             company: item.attributes.company,
             exchange: item.attributes.exchange,
         })
-        .collect())
+        .collect();
+    Ok((tickers, updated_cookies))
+}
+
+fn merge_set_cookies(current: &str, headers: &reqwest::header::HeaderMap) -> String {
+    use std::collections::BTreeMap;
+    let mut jar: BTreeMap<String, String> = current
+        .split(';')
+        .filter_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect();
+
+    for sc in headers.get_all("set-cookie") {
+        let Ok(s) = sc.to_str() else { continue };
+        let main_part = s.split(';').next().unwrap_or("");
+        if let Some((name, value)) = main_part.split_once('=') {
+            jar.insert(name.trim().to_string(), value.trim().to_string());
+        }
+    }
+
+    jar.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }

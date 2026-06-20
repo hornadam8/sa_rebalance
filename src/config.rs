@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 pub struct Env {
     pub sa_cookie: String,
+    pub sa_cookie_path: Option<String>,
     pub schwab_client_id: String,
     pub schwab_client_secret: String,
     pub schwab_redirect_uri: String,
@@ -25,6 +26,7 @@ impl Env {
             .collect();
         Ok(Self {
             sa_cookie: var("SA_COOKIE")?,
+            sa_cookie_path: std::env::var("SA_COOKIE_PATH").ok().filter(|s| !s.is_empty()),
             schwab_client_id: var("SCHWAB_CLIENT_ID")?,
             schwab_client_secret: var("SCHWAB_CLIENT_SECRET")?,
             schwab_redirect_uri: var("SCHWAB_REDIRECT_URI")?,
