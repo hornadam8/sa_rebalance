@@ -218,6 +218,7 @@ async fn notify_test() -> Result<()> {
     let report = notify::Report {
         run_at: notify::now_local(),
         schwab_days_remaining: 4,
+        sa_cookie_age_days: Some(12),
         top_used: vec![
             "SNDK", "CNC", "SEZL", "PBR", "CSTM", "FRO", "CENX", "GM", "SBLK", "UNCRY", "FMX",
             "INDV", "REPYY", "DINO", "THG", "JAZZ", "PKX", "SM", "ALVOF", "DKILY",
@@ -342,6 +343,7 @@ async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
     let report = notify::Report {
         run_at: notify::now_local(),
         schwab_days_remaining: days_remaining,
+        sa_cookie_age_days: sa_cookie_age_days(&env),
         top_used: top_20.iter().map(|t| t.symbol.clone()).collect(),
         blocked,
         accounts: account_reports,
@@ -479,6 +481,55 @@ fn load_sa_cookie(env: &config::Env) -> String {
     env.sa_cookie.clone()
 }
 
+fn sa_cookie_meta_path(env: &config::Env) -> Option<std::path::PathBuf> {
+    let p = env.sa_cookie_path.as_ref()?;
+    let resolved = resolve_path(p);
+    resolved.parent().map(|d| d.join("sa_cookie_meta.json"))
+}
+
+fn save_sa_cookie_bootstrap_now(env: &config::Env) {
+    let Some(path) = sa_cookie_meta_path(env) else {
+        return;
+    };
+    let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(
+        &path,
+        format!(r#"{{"bootstrapped_at_unix":{}}}"#, now.as_secs()),
+    );
+}
+
+fn sa_cookie_age_days(env: &config::Env) -> Option<i64> {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    if let Some(path) = sa_cookie_meta_path(env) {
+        if let Ok(body) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(unix) = v.get("bootstrapped_at_unix").and_then(|x| x.as_i64()) {
+                    return Some((now_unix - unix).max(0) / 86400);
+                }
+            }
+        }
+    }
+    let cookie_path = env.sa_cookie_path.as_ref()?;
+    let resolved = resolve_path(cookie_path);
+    let metadata = std::fs::metadata(&resolved).ok()?;
+    let mtime = metadata.modified().ok()?;
+    let mtime_unix = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some((now_unix - mtime_unix).max(0) / 86400)
+}
+
 fn save_sa_cookie(env: &config::Env, cookie: &str) {
     let Some(p) = &env.sa_cookie_path else {
         return;
@@ -511,6 +562,7 @@ async fn set_cookie() -> Result<()> {
     let cookie = extract_cookie_value(&input)?;
 
     save_sa_cookie(&env, &cookie);
+    save_sa_cookie_bootstrap_now(&env);
     eprintln!("Stored cookie. Verifying with SA…");
     let (tickers, rotated) = sa::fetch_top_rated(&cookie).await?;
     if rotated != cookie {

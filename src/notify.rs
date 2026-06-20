@@ -15,6 +15,7 @@ use crate::rebalance::{AccountPlan, Side};
 pub struct Report {
     pub run_at: OffsetDateTime,
     pub schwab_days_remaining: i64,
+    pub sa_cookie_age_days: Option<i64>,
     pub top_used: Vec<String>,
     pub blocked: Vec<String>,
     pub accounts: Vec<AccountReport>,
@@ -63,6 +64,13 @@ impl Report {
         let mut out = String::new();
         let _ = writeln!(out, "Run at: {}", self.run_at);
         let _ = writeln!(out, "Schwab re-auth in: {} days", self.schwab_days_remaining);
+        if let Some(d) = self.sa_cookie_age_days {
+            let _ = writeln!(
+                out,
+                "SA cookie last refreshed: {d} day{} ago",
+                if d == 1 { "" } else { "s" }
+            );
+        }
         let _ = writeln!(out);
         let _ = writeln!(out, "Top 20 used:");
         for (i, sym) in self.top_used.iter().enumerate() {
@@ -199,6 +207,13 @@ impl Report {
             r#"<div style="margin-top:14px;font-size:14px;color:{reauth_color};font-weight:{reauth_weight};">Schwab re-auth in {} days</div>"#,
             self.schwab_days_remaining
         );
+        if let Some(d) = self.sa_cookie_age_days {
+            let _ = write!(
+                s,
+                r#"<div style="margin-top:4px;font-size:13px;color:#718096;">SA cookie last refreshed {d} day{} ago</div>"#,
+                if d == 1 { "" } else { "s" }
+            );
+        }
 
         let _ = write!(
             s,
