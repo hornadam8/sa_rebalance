@@ -12,8 +12,8 @@ echo "Building release binary..."
 echo "Creating log directory at $LOG_DIR"
 mkdir -p "$LOG_DIR"
 
-echo "Copying plist to $PLIST_DST"
-cp "$PLIST_SRC" "$PLIST_DST"
+echo "Generating plist at $PLIST_DST (substituting __HOME__ and __PROJECT_DIR__)"
+sed -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" -e "s|__HOME__|$HOME|g" "$PLIST_SRC" > "$PLIST_DST"
 
 echo "Unloading any existing job..."
 launchctl unload "$PLIST_DST" 2>/dev/null || true
