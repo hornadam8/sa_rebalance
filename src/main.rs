@@ -503,11 +503,15 @@ fn today_local_str() -> String {
         .unwrap_or_default()
 }
 
+fn cache_is_fresh(cache: &TopListCache, today: &str) -> bool {
+    cache.date == today
+}
+
 fn load_top_list_cache() -> Option<TopListCache> {
     let path = sa_cache_path()?;
     let body = std::fs::read_to_string(&path).ok()?;
     let cache: TopListCache = serde_json::from_str(&body).ok()?;
-    if cache.date == today_local_str() {
+    if cache_is_fresh(&cache, &today_local_str()) {
         Some(cache)
     } else {
         None
@@ -709,4 +713,80 @@ async fn screen(top: usize) -> Result<()> {
         println!("{:>3}. {:<8} {:<10} {}", i + 1, t.symbol, t.exchange, t.company);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_path_expands_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let resolved = resolve_path("~/foo/bar");
+        assert_eq!(resolved, home.join("foo/bar"));
+    }
+
+    #[test]
+    fn resolve_path_passes_absolute_through() {
+        let resolved = resolve_path("/tmp/foo");
+        assert_eq!(resolved.to_str().unwrap(), "/tmp/foo");
+    }
+
+    #[test]
+    fn resolve_path_handles_relative() {
+        let resolved = resolve_path("foo/bar");
+        assert_eq!(resolved.to_str().unwrap(), "foo/bar");
+    }
+
+    #[test]
+    fn extract_cookie_value_from_curl_single_quoted() {
+        let input = "curl 'https://example.com' -H 'accept: json' -b 'session=abc; user=42' -H 'x: y'";
+        let result = extract_cookie_value(input).unwrap();
+        assert_eq!(result, "session=abc; user=42");
+    }
+
+    #[test]
+    fn extract_cookie_value_from_curl_double_quoted() {
+        let input = r#"curl "url" -b "k1=v1; k2=v2" -H "h: v""#;
+        let result = extract_cookie_value(input).unwrap();
+        assert_eq!(result, "k1=v1; k2=v2");
+    }
+
+    #[test]
+    fn extract_cookie_value_accepts_raw_cookie_string() {
+        let result = extract_cookie_value("k1=v1; k2=v2").unwrap();
+        assert_eq!(result, "k1=v1; k2=v2");
+    }
+
+    #[test]
+    fn extract_cookie_value_strips_surrounding_quotes() {
+        let result = extract_cookie_value("'k=v'").unwrap();
+        assert_eq!(result, "k=v");
+    }
+
+    #[test]
+    fn extract_cookie_value_rejects_input_without_equals() {
+        let result = extract_cookie_value("just some text no kv pairs");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cache_is_fresh_when_dates_match() {
+        let cache = TopListCache {
+            date: "2026-06-22".into(),
+            top_20: vec![],
+            spares: vec![],
+        };
+        assert!(cache_is_fresh(&cache, "2026-06-22"));
+    }
+
+    #[test]
+    fn cache_is_stale_when_dates_differ() {
+        let cache = TopListCache {
+            date: "2026-06-21".into(),
+            top_20: vec![],
+            spares: vec![],
+        };
+        assert!(!cache_is_fresh(&cache, "2026-06-22"));
+    }
 }
