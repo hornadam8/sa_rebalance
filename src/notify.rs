@@ -495,3 +495,85 @@ pub async fn send_email(env: &Env, report: &Report) -> Result<()> {
     mailer.send(email).await.context("sending email")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_money_inserts_thousands_separators() {
+        assert_eq!(fmt_money(1234567.89), "$1,234,567.89");
+        assert_eq!(fmt_money(1000.0), "$1,000.00");
+        assert_eq!(fmt_money(999.99), "$999.99");
+    }
+
+    #[test]
+    fn fmt_money_handles_negative() {
+        assert_eq!(fmt_money(-1234.56), "-$1,234.56");
+    }
+
+    #[test]
+    fn fmt_money_handles_zero() {
+        assert_eq!(fmt_money(0.0), "$0.00");
+    }
+
+    #[test]
+    fn fmt_price_trims_trailing_zeros() {
+        assert_eq!(fmt_price(161.4200), "$161.42");
+        assert_eq!(fmt_price(40.5800), "$40.58");
+    }
+
+    #[test]
+    fn fmt_price_keeps_significant_decimals() {
+        assert_eq!(fmt_price(14.8537), "$14.8537");
+        assert_eq!(fmt_price(161.4250), "$161.425");
+    }
+
+    #[test]
+    fn fmt_price_pads_to_two_decimals_minimum() {
+        assert_eq!(fmt_price(100.0), "$100.00");
+        assert_eq!(fmt_price(50.5), "$50.50");
+    }
+
+    #[test]
+    fn with_thousands_handles_small_numbers() {
+        assert_eq!(with_thousands(0), "0");
+        assert_eq!(with_thousands(42), "42");
+        assert_eq!(with_thousands(999), "999");
+    }
+
+    #[test]
+    fn with_thousands_inserts_commas() {
+        assert_eq!(with_thousands(1000), "1,000");
+        assert_eq!(with_thousands(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn equity_change_html_empty_when_no_prior() {
+        let html = equity_change_html(1000.0, None, None);
+        assert!(html.is_empty());
+    }
+
+    #[test]
+    fn equity_change_html_shows_positive_delta_in_green() {
+        let html = equity_change_html(1100.0, Some(1000.0), None);
+        assert!(html.contains("+"));
+        assert!(html.contains("10.00%"));
+        assert!(html.contains("#2f855a"));
+    }
+
+    #[test]
+    fn equity_change_html_shows_negative_delta_in_red() {
+        let html = equity_change_html(900.0, Some(1000.0), None);
+        assert!(html.contains("10.00%"));
+        assert!(html.contains("#c53030"));
+    }
+
+    #[test]
+    fn html_escape_protects_against_injection() {
+        let escaped = html_escape(r#"<script>alert("x")</script>"#);
+        assert!(!escaped.contains("<script>"));
+        assert!(escaped.contains("&lt;script&gt;"));
+        assert!(escaped.contains("&quot;"));
+    }
+}

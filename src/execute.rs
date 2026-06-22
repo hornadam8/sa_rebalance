@@ -307,3 +307,98 @@ pub fn sanity_warning(plan: &AccountPlan, residual: f64) -> Option<String> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rebalance::Side;
+
+    fn plan(equity: f64, cash: f64, target: f64) -> AccountPlan {
+        AccountPlan {
+            account_number: "1".into(),
+            account_hash: "H".into(),
+            equity,
+            cash,
+            target_per_name: target,
+            subset_size: 20,
+            sells: vec![],
+            buys: vec![],
+            skipped_unaffordable: vec![],
+            missing_quotes: vec![],
+            estimated_residual_cash: 0.0,
+            pre_trade_holdings: HashSet::new(),
+        }
+    }
+
+    fn trade(symbol: &str, side: Side, shares: u32, px: f64) -> Trade {
+        Trade {
+            symbol: symbol.into(),
+            side,
+            shares,
+            indicative_price: px,
+        }
+    }
+
+    fn fill(t: Trade) -> Fill {
+        Fill {
+            filled_quantity: t.shares,
+            avg_price: t.indicative_price,
+            trade: t,
+        }
+    }
+
+    fn report_with(fills: Vec<Fill>) -> AccountExecutionReport {
+        AccountExecutionReport {
+            account_number: "1".into(),
+            fills,
+            failures: vec![],
+        }
+    }
+
+    #[test]
+    fn residual_zero_when_buys_equal_sells_plus_cash() {
+        let p = plan(1000.0, 10.0, 100.0);
+        let r = report_with(vec![
+            fill(trade("A", Side::Sell, 10, 50.0)),
+            fill(trade("B", Side::Buy, 51, 10.0)),
+        ]);
+        let residual = compute_residual_cash(&p, &r);
+        assert!((residual - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn residual_positive_when_sells_exceed_buys() {
+        let p = plan(1000.0, 0.0, 100.0);
+        let r = report_with(vec![
+            fill(trade("A", Side::Sell, 10, 100.0)),
+            fill(trade("B", Side::Buy, 5, 100.0)),
+        ]);
+        let residual = compute_residual_cash(&p, &r);
+        assert!((residual - 500.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn sanity_warning_fires_when_residual_above_position_size() {
+        let p = plan(10000.0, 0.0, 500.0);
+        let warning = sanity_warning(&p, 800.0);
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn sanity_warning_silent_when_residual_below_threshold() {
+        let p = plan(10000.0, 0.0, 500.0);
+        let warning = sanity_warning(&p, 50.0);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn sanity_warning_uses_one_percent_floor_for_small_targets() {
+        let p = plan(100000.0, 0.0, 1.0);
+        // 1% of equity = 1000. residual 500 < 1000 → silent.
+        let warning = sanity_warning(&p, 500.0);
+        assert!(warning.is_none());
+        // residual 2000 > 1000 → warns.
+        let warning = sanity_warning(&p, 2000.0);
+        assert!(warning.is_some());
+    }
+}

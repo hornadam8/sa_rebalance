@@ -220,3 +220,183 @@ fn allocate_shares(
 
     alloc
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schwab::trader::{Account, Position};
+
+    fn ticker(symbol: &str) -> Ticker {
+        Ticker {
+            symbol: symbol.to_string(),
+            company: format!("{symbol} Co."),
+            exchange: "NYSE".to_string(),
+        }
+    }
+
+    fn price_map(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn pos(symbol: &str, qty: f64, price: f64) -> Position {
+        Position {
+            symbol: symbol.to_string(),
+            quantity: qty,
+            market_value: qty * price,
+            average_price: price,
+        }
+    }
+
+    fn account(equity: f64, cash: f64, positions: Vec<Position>) -> Account {
+        Account {
+            account_number: "1".into(),
+            account_hash: "H".into(),
+            account_type: "MARGIN".into(),
+            equity,
+            cash,
+            positions,
+        }
+    }
+
+    #[test]
+    fn affordable_subset_keeps_all_when_target_above_all_prices() {
+        let tickers = vec![ticker("A"), ticker("B"), ticker("C")];
+        let refs: Vec<&Ticker> = tickers.iter().collect();
+        let prices = price_map(&[("A", 100.0), ("B", 200.0), ("C", 300.0)]);
+        let subset = affordable_subset(&refs, &prices, 3000.0);
+        assert_eq!(subset.len(), 3);
+    }
+
+    #[test]
+    fn affordable_subset_drops_unaffordable_until_stable() {
+        let tickers = vec![ticker("CHEAP"), ticker("MID"), ticker("EXPENSIVE")];
+        let refs: Vec<&Ticker> = tickers.iter().collect();
+        let prices = price_map(&[("CHEAP", 5.0), ("MID", 50.0), ("EXPENSIVE", 2000.0)]);
+        let subset = affordable_subset(&refs, &prices, 1000.0);
+        let syms: Vec<&str> = subset.iter().map(|t| t.symbol.as_str()).collect();
+        assert_eq!(syms, vec!["CHEAP", "MID"]);
+    }
+
+    #[test]
+    fn affordable_subset_handles_cascading_drops() {
+        let tickers = vec![ticker("A"), ticker("B"), ticker("C")];
+        let refs: Vec<&Ticker> = tickers.iter().collect();
+        let prices = price_map(&[("A", 10.0), ("B", 400.0), ("C", 500.0)]);
+        let subset = affordable_subset(&refs, &prices, 600.0);
+        let syms: Vec<&str> = subset.iter().map(|t| t.symbol.as_str()).collect();
+        assert_eq!(syms, vec!["A"]);
+    }
+
+    #[test]
+    fn allocate_shares_floors_initial_allocation() {
+        let tickers = vec![ticker("A"), ticker("B")];
+        let refs: Vec<&Ticker> = tickers.iter().collect();
+        let prices = price_map(&[("A", 100.0), ("B", 200.0)]);
+        let alloc = allocate_shares(&refs, &prices, 1000.0);
+        assert!(alloc["A"] >= 5);
+        assert!(alloc["B"] >= 2);
+    }
+
+    #[test]
+    fn allocate_shares_fully_invests_until_no_share_affordable() {
+        let tickers = vec![ticker("CHEAP"), ticker("MID")];
+        let refs: Vec<&Ticker> = tickers.iter().collect();
+        let prices = price_map(&[("CHEAP", 10.0), ("MID", 50.0)]);
+        let equity = 1000.0;
+        let alloc = allocate_shares(&refs, &prices, equity);
+        let invested: f64 = alloc
+            .iter()
+            .map(|(s, n)| *n as f64 * prices[s])
+            .sum();
+        let residual = equity - invested;
+        let min_price = prices.values().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            residual < min_price,
+            "residual {residual} should be below cheapest share {min_price}"
+        );
+    }
+
+    #[test]
+    fn allocate_shares_empty_subset_yields_empty_alloc() {
+        let prices = price_map(&[]);
+        let alloc = allocate_shares(&[], &prices, 1000.0);
+        assert!(alloc.is_empty());
+    }
+
+    #[test]
+    fn plan_account_sells_positions_outside_subset() {
+        let top = vec![ticker("A"), ticker("B")];
+        let prices = price_map(&[("A", 100.0), ("B", 50.0), ("OLD", 25.0)]);
+        let acc = account(
+            2000.0,
+            0.0,
+            vec![pos("A", 10.0, 100.0), pos("OLD", 40.0, 25.0)],
+        );
+        let plan = plan_account(&acc, &top, &prices);
+        assert!(plan.sells.iter().any(|t| t.symbol == "OLD" && t.shares == 40));
+    }
+
+    #[test]
+    fn plan_account_buys_to_reach_target() {
+        let top = vec![ticker("A"), ticker("B")];
+        let prices = price_map(&[("A", 100.0), ("B", 50.0)]);
+        let acc = account(2000.0, 2000.0, vec![]);
+        let plan = plan_account(&acc, &top, &prices);
+        let a_buy: u32 = plan
+            .buys
+            .iter()
+            .filter(|t| t.symbol == "A")
+            .map(|t| t.shares)
+            .sum();
+        let b_buy: u32 = plan
+            .buys
+            .iter()
+            .filter(|t| t.symbol == "B")
+            .map(|t| t.shares)
+            .sum();
+        assert!(a_buy >= 9, "should buy ~10 shares of A, got {a_buy}");
+        assert!(b_buy >= 19, "should buy ~20 shares of B, got {b_buy}");
+    }
+
+    #[test]
+    fn plan_account_records_skipped_unaffordable() {
+        let top = vec![ticker("CHEAP"), ticker("PRICEY")];
+        let prices = price_map(&[("CHEAP", 10.0), ("PRICEY", 5000.0)]);
+        let acc = account(1000.0, 1000.0, vec![]);
+        let plan = plan_account(&acc, &top, &prices);
+        assert_eq!(plan.skipped_unaffordable, vec!["PRICEY"]);
+        assert_eq!(plan.subset_size, 1);
+    }
+
+    #[test]
+    fn plan_account_records_missing_quotes() {
+        let top = vec![ticker("HAS_QUOTE"), ticker("NO_QUOTE")];
+        let prices = price_map(&[("HAS_QUOTE", 50.0)]);
+        let acc = account(1000.0, 1000.0, vec![]);
+        let plan = plan_account(&acc, &top, &prices);
+        assert_eq!(plan.missing_quotes, vec!["NO_QUOTE"]);
+    }
+
+    #[test]
+    fn plan_account_captures_pre_trade_holdings() {
+        let top = vec![ticker("A")];
+        let prices = price_map(&[("A", 100.0), ("OLD", 25.0)]);
+        let acc = account(
+            1000.0,
+            0.0,
+            vec![pos("A", 5.0, 100.0), pos("OLD", 20.0, 25.0)],
+        );
+        let plan = plan_account(&acc, &top, &prices);
+        assert!(plan.pre_trade_holdings.contains("A"));
+        assert!(plan.pre_trade_holdings.contains("OLD"));
+    }
+
+    #[test]
+    fn plan_account_residual_cash_estimate_is_nonnegative() {
+        let top = vec![ticker("A"), ticker("B"), ticker("C")];
+        let prices = price_map(&[("A", 17.0), ("B", 23.0), ("C", 41.0)]);
+        let acc = account(1000.0, 1000.0, vec![]);
+        let plan = plan_account(&acc, &top, &prices);
+        assert!(plan.estimated_residual_cash >= 0.0);
+    }
+}

@@ -94,6 +94,15 @@ pub async fn fetch_top_rated(sa_cookie: &str) -> Result<(Vec<Ticker>, String)> {
 }
 
 fn merge_set_cookies(current: &str, headers: &reqwest::header::HeaderMap) -> String {
+    let set_cookies: Vec<String> = headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(String::from))
+        .collect();
+    merge_set_cookies_raw(current, &set_cookies)
+}
+
+fn merge_set_cookies_raw(current: &str, set_cookies: &[String]) -> String {
     use std::collections::BTreeMap;
     let mut jar: BTreeMap<String, String> = current
         .split(';')
@@ -103,8 +112,7 @@ fn merge_set_cookies(current: &str, headers: &reqwest::header::HeaderMap) -> Str
         })
         .collect();
 
-    for sc in headers.get_all("set-cookie") {
-        let Ok(s) = sc.to_str() else { continue };
+    for s in set_cookies {
         let main_part = s.split(';').next().unwrap_or("");
         if let Some((name, value)) = main_part.split_once('=') {
             jar.insert(name.trim().to_string(), value.trim().to_string());
@@ -115,4 +123,51 @@ fn merge_set_cookies(current: &str, headers: &reqwest::header::HeaderMap) -> Str
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_adds_new_cookie() {
+        let current = "session_id=ABC";
+        let set = vec!["new_cookie=XYZ; Path=/; HttpOnly".to_string()];
+        let merged = merge_set_cookies_raw(current, &set);
+        assert!(merged.contains("session_id=ABC"));
+        assert!(merged.contains("new_cookie=XYZ"));
+    }
+
+    #[test]
+    fn merge_replaces_existing_value() {
+        let current = "session_id=OLD; user_id=42";
+        let set = vec!["session_id=NEW; Path=/".to_string()];
+        let merged = merge_set_cookies_raw(current, &set);
+        assert!(merged.contains("session_id=NEW"));
+        assert!(!merged.contains("session_id=OLD"));
+        assert!(merged.contains("user_id=42"));
+    }
+
+    #[test]
+    fn merge_strips_set_cookie_attributes() {
+        let set = vec!["foo=bar; Expires=Wed, 01 Jan 2027 00:00:00 GMT; Path=/; HttpOnly; Secure".to_string()];
+        let merged = merge_set_cookies_raw("", &set);
+        assert_eq!(merged.trim(), "foo=bar");
+    }
+
+    #[test]
+    fn merge_with_empty_input_returns_only_new() {
+        let set = vec!["a=1".to_string(), "b=2".to_string()];
+        let merged = merge_set_cookies_raw("", &set);
+        assert!(merged.contains("a=1"));
+        assert!(merged.contains("b=2"));
+    }
+
+    #[test]
+    fn merge_with_no_set_cookies_returns_current() {
+        let current = "x=1; y=2";
+        let merged = merge_set_cookies_raw(current, &[]);
+        assert!(merged.contains("x=1"));
+        assert!(merged.contains("y=2"));
+    }
 }

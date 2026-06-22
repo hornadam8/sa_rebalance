@@ -53,11 +53,27 @@ impl Client {
         if self.tokens.refresh_expires_at <= now {
             anyhow::bail!("Schwab refresh token expired — re-run `sa_rebalance auth`");
         }
-        let refreshed =
-            auth::refresh(&self.http, &self.client_id, &self.client_secret, &self.tokens).await?;
-        auth::save_tokens(&refreshed)?;
-        self.tokens = refreshed;
-        Ok(())
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..2u32 {
+            if attempt > 0 {
+                eprintln!(
+                    "token refresh attempt {} failed, sleeping 300s and retrying once...",
+                    attempt
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            }
+            match auth::refresh(&self.http, &self.client_id, &self.client_secret, &self.tokens)
+                .await
+            {
+                Ok(refreshed) => {
+                    auth::save_tokens(&refreshed)?;
+                    self.tokens = refreshed;
+                    return Ok(());
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap())
     }
 
     pub fn days_until_reauth(&self) -> i64 {
@@ -373,4 +389,130 @@ pub fn parse_accounts(numbers: &Value, accounts: &Value) -> Result<Vec<Account>>
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn quote_price_prefers_mark() {
+        let q = Quote { bid: 9.0, ask: 11.0, mark: 10.0 };
+        assert_eq!(q.price(), 10.0);
+    }
+
+    #[test]
+    fn quote_price_falls_back_to_bid_ask_mid() {
+        let q = Quote { bid: 100.0, ask: 102.0, mark: 0.0 };
+        assert_eq!(q.price(), 101.0);
+    }
+
+    #[test]
+    fn quote_price_uses_ask_when_only_ask() {
+        let q = Quote { bid: 0.0, ask: 50.0, mark: 0.0 };
+        assert_eq!(q.price(), 50.0);
+    }
+
+    #[test]
+    fn quote_price_zero_when_all_zero() {
+        let q = Quote { bid: 0.0, ask: 0.0, mark: 0.0 };
+        assert_eq!(q.price(), 0.0);
+    }
+
+    #[test]
+    fn extract_quote_reads_all_three_fields() {
+        let body = json!({
+            "quote": { "bidPrice": 9.5, "askPrice": 10.5, "mark": 10.0 }
+        });
+        let q = extract_quote(&body).expect("should parse");
+        assert_eq!(q.bid, 9.5);
+        assert_eq!(q.ask, 10.5);
+        assert_eq!(q.mark, 10.0);
+    }
+
+    #[test]
+    fn extract_quote_falls_back_to_last_price() {
+        let body = json!({ "quote": { "lastPrice": 42.0 } });
+        let q = extract_quote(&body).expect("should parse");
+        assert_eq!(q.mark, 42.0);
+    }
+
+    #[test]
+    fn extract_quote_returns_none_for_empty() {
+        let body = json!({ "quote": {} });
+        assert!(extract_quote(&body).is_none());
+    }
+
+    #[test]
+    fn parse_accounts_extracts_basic_account_data() {
+        let numbers = json!([
+            {"accountNumber": "12345", "hashValue": "HASH123"}
+        ]);
+        let accounts = json!([{
+            "securitiesAccount": {
+                "type": "MARGIN",
+                "accountNumber": "12345",
+                "currentBalances": {
+                    "liquidationValue": 50000.0,
+                    "cashBalance": 1000.0,
+                },
+                "positions": [{
+                    "instrument": {"assetType": "EQUITY", "symbol": "AAPL"},
+                    "longQuantity": 10.0,
+                    "shortQuantity": 0.0,
+                    "marketValue": 1500.0,
+                    "averagePrice": 150.0,
+                }]
+            }
+        }]);
+        let parsed = parse_accounts(&numbers, &accounts).expect("should parse");
+        assert_eq!(parsed.len(), 1);
+        let a = &parsed[0];
+        assert_eq!(a.account_number, "12345");
+        assert_eq!(a.account_hash, "HASH123");
+        assert_eq!(a.equity, 50000.0);
+        assert_eq!(a.cash, 1000.0);
+        assert_eq!(a.positions.len(), 1);
+        assert_eq!(a.positions[0].symbol, "AAPL");
+        assert_eq!(a.positions[0].quantity, 10.0);
+    }
+
+    #[test]
+    fn parse_accounts_skips_non_equity_positions() {
+        let numbers = json!([{"accountNumber": "12345", "hashValue": "HASH"}]);
+        let accounts = json!([{
+            "securitiesAccount": {
+                "type": "MARGIN",
+                "accountNumber": "12345",
+                "currentBalances": {"liquidationValue": 1000.0, "cashBalance": 100.0},
+                "positions": [
+                    {"instrument": {"assetType": "EQUITY", "symbol": "AAPL"}, "longQuantity": 5.0, "shortQuantity": 0.0, "marketValue": 750.0, "averagePrice": 150.0},
+                    {"instrument": {"assetType": "OPTION", "symbol": "AAPL  240517P00150000"}, "longQuantity": 1.0, "shortQuantity": 0.0, "marketValue": 100.0, "averagePrice": 100.0},
+                ]
+            }
+        }]);
+        let parsed = parse_accounts(&numbers, &accounts).expect("should parse");
+        assert_eq!(parsed[0].positions.len(), 1);
+        assert_eq!(parsed[0].positions[0].symbol, "AAPL");
+    }
+
+    #[test]
+    fn parse_accounts_falls_back_to_derived_equity() {
+        let numbers = json!([{"accountNumber": "X", "hashValue": "Y"}]);
+        let accounts = json!([{
+            "securitiesAccount": {
+                "type": "CASH",
+                "accountNumber": "X",
+                "currentBalances": {
+                    "cashBalance": 500.0,
+                    "longMarketValue": 1500.0,
+                },
+                "positions": []
+            }
+        }]);
+        let parsed = parse_accounts(&numbers, &accounts).expect("should parse");
+        // cash + longMarketValue - shortMarketValue = 500 + 1500 = 2000
+        assert_eq!(parsed[0].equity, 2000.0);
+    }
 }

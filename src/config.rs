@@ -49,10 +49,50 @@ pub fn blocklist_path() -> PathBuf {
 pub fn load_blocklist(path: &Path) -> Result<HashSet<String>> {
     let body = std::fs::read_to_string(path)
         .with_context(|| format!("reading blocklist at {}", path.display()))?;
-    Ok(body
-        .lines()
+    Ok(parse_blocklist(&body))
+}
+
+fn parse_blocklist(body: &str) -> HashSet<String> {
+    body.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| l.to_ascii_uppercase())
-        .collect())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocklist_parses_one_symbol_per_line() {
+        let result = parse_blocklist("SHIP\nFOO\nBAR\n");
+        assert_eq!(result.len(), 3);
+        assert!(result.contains("SHIP"));
+        assert!(result.contains("FOO"));
+        assert!(result.contains("BAR"));
+    }
+
+    #[test]
+    fn blocklist_skips_comments_and_empty_lines() {
+        let body = "# this is a comment\nSHIP\n\n  # indented comment\nFOO\n\n";
+        let result = parse_blocklist(body);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains("SHIP"));
+        assert!(result.contains("FOO"));
+    }
+
+    #[test]
+    fn blocklist_uppercases_symbols() {
+        let result = parse_blocklist("ship\nFoO\n");
+        assert!(result.contains("SHIP"));
+        assert!(result.contains("FOO"));
+    }
+
+    #[test]
+    fn blocklist_trims_whitespace() {
+        let result = parse_blocklist("  SHIP  \n\tFOO\t\n");
+        assert!(result.contains("SHIP"));
+        assert!(result.contains("FOO"));
+    }
 }
