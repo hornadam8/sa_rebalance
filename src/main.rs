@@ -286,18 +286,7 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
     }
 
     let blocklist = config::load_blocklist(&config::blocklist_path())?;
-    let cookie = load_sa_cookie(&env);
-    let (raw_sa, rotated) = sa::fetch_top_rated(&cookie).await?;
-    if rotated != cookie {
-        save_sa_cookie(&env, &rotated);
-    }
-    let filtered_sa: Vec<sa::Ticker> = raw_sa
-        .into_iter()
-        .filter(|t| !blocklist.contains(&t.symbol.to_ascii_uppercase()))
-        .collect();
-    let split_at = 20.min(filtered_sa.len());
-    let top_20: Vec<sa::Ticker> = filtered_sa[..split_at].to_vec();
-    let spares: Vec<sa::Ticker> = filtered_sa[split_at..].to_vec();
+    let (top_20, spares) = get_or_fetch_top_lists(env, &blocklist).await?;
 
     let client = schwab::trader::Client::new(&env).await?;
 
@@ -503,6 +492,75 @@ fn print_plan(p: &rebalance::AccountPlan) {
         }
     }
     println!("  estimated residual cash: ${:.2}\n", p.estimated_residual_cash);
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TopListCache {
+    date: String,
+    top_20: Vec<sa::Ticker>,
+    spares: Vec<sa::Ticker>,
+}
+
+fn sa_cache_path() -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".local/state/sa_rebalance/sa_top_list.json"))
+}
+
+fn today_local_str() -> String {
+    let now = notify::now_local();
+    now.format(time::macros::format_description!("[year]-[month]-[day]"))
+        .unwrap_or_default()
+}
+
+fn load_top_list_cache() -> Option<TopListCache> {
+    let path = sa_cache_path()?;
+    let body = std::fs::read_to_string(&path).ok()?;
+    let cache: TopListCache = serde_json::from_str(&body).ok()?;
+    if cache.date == today_local_str() {
+        Some(cache)
+    } else {
+        None
+    }
+}
+
+fn save_top_list_cache(cache: &TopListCache) {
+    let Some(path) = sa_cache_path() else { return };
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if let Ok(body) = serde_json::to_string_pretty(cache) {
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+async fn get_or_fetch_top_lists(
+    env: &config::Env,
+    blocklist: &std::collections::HashSet<String>,
+) -> Result<(Vec<sa::Ticker>, Vec<sa::Ticker>)> {
+    if let Some(cache) = load_top_list_cache() {
+        eprintln!("using cached SA top-list from {}", cache.date);
+        return Ok((cache.top_20, cache.spares));
+    }
+    let cookie = load_sa_cookie(env);
+    let (raw_sa, rotated) = sa::fetch_top_rated(&cookie).await?;
+    if rotated != cookie {
+        save_sa_cookie(env, &rotated);
+    }
+    let filtered: Vec<sa::Ticker> = raw_sa
+        .into_iter()
+        .filter(|t| !blocklist.contains(&t.symbol.to_ascii_uppercase()))
+        .collect();
+    let split = 20.min(filtered.len());
+    let top_20 = filtered[..split].to_vec();
+    let spares = filtered[split..].to_vec();
+    save_top_list_cache(&TopListCache {
+        date: today_local_str(),
+        top_20: top_20.clone(),
+        spares: spares.clone(),
+    });
+    Ok((top_20, spares))
 }
 
 fn resolve_path(s: &str) -> std::path::PathBuf {
