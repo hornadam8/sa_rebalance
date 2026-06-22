@@ -207,7 +207,16 @@ impl Client {
             match status {
                 "FILLED" => return Ok(order),
                 "REJECTED" | "CANCELED" | "EXPIRED" => {
-                    anyhow::bail!("order {} ended with status {}", order_id, status);
+                    let reason = extract_rejection_reason(&order);
+                    eprintln!(
+                        "order {order_id} {status} — full order JSON: {}",
+                        serde_json::to_string(&order).unwrap_or_default()
+                    );
+                    if let Some(r) = reason {
+                        anyhow::bail!("order {} {}: {}", order_id, status, r);
+                    } else {
+                        anyhow::bail!("order {} {} (no reason field; see launchd.err.log)", order_id, status);
+                    }
                 }
                 _ => {}
             }
@@ -319,6 +328,27 @@ impl Quote {
             0.0
         }
     }
+}
+
+fn extract_rejection_reason(order: &Value) -> Option<String> {
+    let str_field = |obj: &Value, key: &str| -> Option<String> {
+        obj.get(key).and_then(Value::as_str).map(str::to_string)
+    };
+    for key in &["statusDescription", "rejectReason", "rejectionReason", "cancelTime"] {
+        if let Some(s) = str_field(order, key) {
+            return Some(s);
+        }
+    }
+    if let Some(activities) = order.get("orderActivityCollection").and_then(Value::as_array) {
+        for a in activities {
+            for key in &["rejectionReason", "statusDescription", "rejectReason"] {
+                if let Some(s) = str_field(a, key) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn extract_quote(body: &Value) -> Option<Quote> {
@@ -434,6 +464,51 @@ mod tests {
     fn quote_price_zero_when_all_zero() {
         let q = Quote { bid: 0.0, ask: 0.0, mark: 0.0 };
         assert_eq!(q.price(), 0.0);
+    }
+
+    #[test]
+    fn extract_rejection_reason_finds_status_description() {
+        let order = serde_json::json!({
+            "status": "REJECTED",
+            "statusDescription": "Symbol restricted from electronic trading"
+        });
+        assert_eq!(
+            extract_rejection_reason(&order).as_deref(),
+            Some("Symbol restricted from electronic trading")
+        );
+    }
+
+    #[test]
+    fn extract_rejection_reason_finds_reject_reason() {
+        let order = serde_json::json!({
+            "status": "REJECTED",
+            "rejectReason": "Insufficient buying power"
+        });
+        assert_eq!(
+            extract_rejection_reason(&order).as_deref(),
+            Some("Insufficient buying power")
+        );
+    }
+
+    #[test]
+    fn extract_rejection_reason_finds_nested_activity_reason() {
+        let order = serde_json::json!({
+            "status": "REJECTED",
+            "orderActivityCollection": [{
+                "activityType": "EXECUTION",
+                "rejectionReason": "Order would create wash sale"
+            }]
+        });
+        assert_eq!(
+            extract_rejection_reason(&order).as_deref(),
+            Some("Order would create wash sale")
+        );
+    }
+
+    #[test]
+    fn extract_rejection_reason_returns_none_when_no_fields_present() {
+        let order = serde_json::json!({"status": "REJECTED"});
+        assert!(extract_rejection_reason(&order).is_none());
     }
 
     #[test]
