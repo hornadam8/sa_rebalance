@@ -152,6 +152,7 @@ async fn notify_test() -> Result<()> {
         skipped_unaffordable: vec![],
         missing_quotes: vec![],
         estimated_residual_cash: 2.96,
+        pre_trade_holdings: std::collections::HashSet::new(),
     };
     let big_exec = AccountExecutionReport {
         account_number: "29006453".into(),
@@ -195,6 +196,7 @@ async fn notify_test() -> Result<()> {
         skipped_unaffordable: vec!["SNDK".into()],
         missing_quotes: vec![],
         estimated_residual_cash: 19.63,
+        pre_trade_holdings: std::collections::HashSet::new(),
     };
     let small_exec = AccountExecutionReport {
         account_number: "57136195".into(),

@@ -30,6 +30,7 @@ pub struct AccountPlan {
     pub skipped_unaffordable: Vec<String>,
     pub missing_quotes: Vec<String>,
     pub estimated_residual_cash: f64,
+    pub pre_trade_holdings: HashSet<String>,
 }
 
 pub fn plan_account(
@@ -129,6 +130,13 @@ pub fn plan_account(
     let buy_cost: f64 = buys.iter().map(|t| t.indicative_price * t.shares as f64).sum();
     let estimated_residual_cash = account.cash + sell_proceeds - buy_cost;
 
+    let pre_trade_holdings: HashSet<String> = account
+        .positions
+        .iter()
+        .filter(|p| p.quantity > 0.0)
+        .map(|p| p.symbol.clone())
+        .collect();
+
     AccountPlan {
         account_number: account.account_number.clone(),
         account_hash: account.account_hash.clone(),
@@ -141,6 +149,7 @@ pub fn plan_account(
         skipped_unaffordable,
         missing_quotes,
         estimated_residual_cash,
+        pre_trade_holdings,
     }
 }
 

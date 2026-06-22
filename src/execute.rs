@@ -202,6 +202,7 @@ async fn run_substitutions(
         .failures
         .iter()
         .filter(|f| matches!(f.trade.side, Side::Buy))
+        .filter(|f| !plan.pre_trade_holdings.contains(&f.trade.symbol))
         .cloned()
         .collect();
     if failed_buys.is_empty() {
