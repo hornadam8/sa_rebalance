@@ -334,7 +334,7 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
 
     let days_remaining = client.days_until_reauth();
     println!("Schwab re-auth in {} days", days_remaining);
-    let exec_reports = execute::run_execute(&client, &plans, &spares, &quotes_map, &exchanges).await?;
+    let exec_reports = execute::run_execute(&client, &plans, &top_20, &spares, &quotes_map, &exchanges).await?;
 
     let prev_snapshots = history::load();
     let mut new_snapshots = prev_snapshots.clone();

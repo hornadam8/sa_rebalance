@@ -155,39 +155,122 @@ fn extract_fill(order: &Value) -> (u32, f64) {
 pub async fn run_execute(
     client: &Client,
     plans: &[AccountPlan],
+    top_20: &[Ticker],
     spares: &[Ticker],
     quotes: &HashMap<String, Quote>,
     exchanges: &HashMap<String, String>,
 ) -> Result<Vec<AccountExecutionReport>> {
     let mut reports = Vec::new();
     for plan in plans {
-        if plan.sells.is_empty() && plan.buys.is_empty() {
-            reports.push(AccountExecutionReport {
-                account_number: plan.account_number.clone(),
-                ..Default::default()
-            });
-            continue;
+        let placed_anything = !plan.sells.is_empty() || !plan.buys.is_empty();
+        if placed_anything {
+            println!(
+                "[{}] placing {} sells, then {} buys",
+                plan.account_number,
+                plan.sells.len(),
+                plan.buys.len()
+            );
         }
-        println!(
-            "[{}] placing {} sells, then {} buys",
-            plan.account_number,
-            plan.sells.len(),
-            plan.buys.len()
-        );
         let mut report = execute_plan(client, plan, quotes, exchanges).await;
-        println!(
-            "[{}] {} fills, {} failures (pre-substitution)",
-            plan.account_number,
-            report.fills.len(),
-            report.failures.len()
-        );
+        if placed_anything {
+            println!(
+                "[{}] {} fills, {} failures (pre-substitution)",
+                plan.account_number,
+                report.fills.len(),
+                report.failures.len()
+            );
+        }
         let subs = run_substitutions(client, plan, &mut report, spares, quotes, exchanges).await;
         if subs > 0 {
             println!("[{}] placed {} substitution buys", plan.account_number, subs);
         }
+        let absorbed = absorb_residual_cash(client, plan, &mut report, top_20, quotes, exchanges).await;
+        if absorbed > 0 {
+            println!("[{}] absorbed {} residual-cash buys", plan.account_number, absorbed);
+        }
         reports.push(report);
     }
     Ok(reports)
+}
+
+async fn absorb_residual_cash(
+    client: &Client,
+    plan: &AccountPlan,
+    report: &mut AccountExecutionReport,
+    subset: &[Ticker],
+    quotes: &HashMap<String, Quote>,
+    exchanges: &HashMap<String, String>,
+) -> usize {
+    let mut absorbed = 0usize;
+    let mut session_failed: HashSet<String> =
+        report.failures.iter().map(|f| f.trade.symbol.clone()).collect();
+    let mut purchased_this_pass: HashSet<String> = HashSet::new();
+
+    loop {
+        let cash = compute_residual_cash(plan, report);
+        if cash < 1.0 {
+            break;
+        }
+        let empty: HashSet<String> = HashSet::new();
+        let Some((ticker, price)) =
+            pick_absorb_candidate(subset, quotes, cash, &session_failed, &purchased_this_pass)
+                .or_else(|| pick_absorb_candidate(subset, quotes, cash, &session_failed, &empty))
+        else {
+            break;
+        };
+        let quote = quotes.get(&ticker.symbol).expect("just looked up");
+
+        let trade = Trade {
+            symbol: ticker.symbol.clone(),
+            side: Side::Buy,
+            shares: 1,
+            indicative_price: price,
+        };
+        let ex = exchanges.get(&ticker.symbol).map(String::as_str);
+        match place_order_routed(
+            client,
+            &plan.account_hash,
+            &ticker.symbol,
+            Side::Buy,
+            1,
+            Some(quote),
+            ex,
+        )
+        .await
+        {
+            Ok(order_id) => match client
+                .await_filled(&plan.account_hash, &order_id, FILL_TIMEOUT)
+                .await
+            {
+                Ok(order) => {
+                    let (qty, p) = extract_fill(&order);
+                    report.fills.push(Fill {
+                        trade,
+                        filled_quantity: qty,
+                        avg_price: p,
+                    });
+                    absorbed += 1;
+                    purchased_this_pass.insert(ticker.symbol.clone());
+                }
+                Err(e) => {
+                    session_failed.insert(ticker.symbol.clone());
+                    report.failures.push(OrderFailure {
+                        trade,
+                        reason: format!("absorb fill: {e}"),
+                    });
+                }
+            },
+            Err(e) => {
+                session_failed.insert(ticker.symbol.clone());
+                report.failures.push(OrderFailure {
+                    trade,
+                    reason: format!("absorb place: {e}"),
+                });
+            }
+        }
+    }
+
+    absorbed
 }
 
 async fn run_substitutions(
@@ -278,6 +361,28 @@ async fn run_substitutions(
     }
 
     placed
+}
+
+fn pick_absorb_candidate<'a>(
+    subset: &'a [Ticker],
+    quotes: &HashMap<String, Quote>,
+    cash: f64,
+    session_failed: &HashSet<String>,
+    purchased_this_pass: &HashSet<String>,
+) -> Option<(&'a Ticker, f64)> {
+    subset
+        .iter()
+        .filter(|t| !session_failed.contains(&t.symbol))
+        .filter(|t| !purchased_this_pass.contains(&t.symbol))
+        .filter_map(|t| {
+            let q = quotes.get(&t.symbol)?;
+            let price = q.price();
+            if price <= 0.0 || price > cash {
+                return None;
+            }
+            Some((t, price))
+        })
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
 }
 
 pub fn compute_residual_cash(plan: &AccountPlan, report: &AccountExecutionReport) -> f64 {
@@ -389,6 +494,98 @@ mod tests {
         let p = plan(10000.0, 0.0, 500.0);
         let warning = sanity_warning(&p, 50.0);
         assert!(warning.is_none());
+    }
+
+    fn ticker(symbol: &str) -> Ticker {
+        Ticker {
+            symbol: symbol.into(),
+            company: format!("{symbol} Co."),
+            exchange: "NYSE".into(),
+        }
+    }
+
+    fn quote_map(pairs: &[(&str, f64)]) -> HashMap<String, Quote> {
+        pairs
+            .iter()
+            .map(|(s, p)| {
+                (
+                    s.to_string(),
+                    Quote {
+                        bid: *p,
+                        ask: *p,
+                        mark: *p,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn absorb_picks_cheapest_affordable_ticker() {
+        let subset = vec![ticker("EXP"), ticker("MID"), ticker("CHEAP")];
+        let quotes = quote_map(&[("EXP", 500.0), ("MID", 50.0), ("CHEAP", 5.0)]);
+        let session_failed = HashSet::new();
+        let purchased = HashSet::new();
+        let candidate = pick_absorb_candidate(&subset, &quotes, 100.0, &session_failed, &purchased);
+        let (t, p) = candidate.expect("should find");
+        assert_eq!(t.symbol, "CHEAP");
+        assert_eq!(p, 5.0);
+    }
+
+    #[test]
+    fn absorb_skips_unaffordable() {
+        let subset = vec![ticker("A"), ticker("B")];
+        let quotes = quote_map(&[("A", 500.0), ("B", 200.0)]);
+        let session_failed = HashSet::new();
+        let purchased = HashSet::new();
+        let candidate = pick_absorb_candidate(&subset, &quotes, 100.0, &session_failed, &purchased);
+        assert!(candidate.is_none());
+    }
+
+    #[test]
+    fn absorb_skips_session_failed() {
+        let subset = vec![ticker("BAD"), ticker("GOOD")];
+        let quotes = quote_map(&[("BAD", 10.0), ("GOOD", 20.0)]);
+        let mut session_failed = HashSet::new();
+        session_failed.insert("BAD".into());
+        let purchased = HashSet::new();
+        let candidate = pick_absorb_candidate(&subset, &quotes, 100.0, &session_failed, &purchased);
+        let (t, _) = candidate.expect("should find GOOD");
+        assert_eq!(t.symbol, "GOOD");
+    }
+
+    #[test]
+    fn absorb_skips_already_purchased_this_pass() {
+        let subset = vec![ticker("CHEAP"), ticker("MID")];
+        let quotes = quote_map(&[("CHEAP", 5.0), ("MID", 50.0)]);
+        let session_failed = HashSet::new();
+        let mut purchased = HashSet::new();
+        purchased.insert("CHEAP".into());
+        let candidate = pick_absorb_candidate(&subset, &quotes, 100.0, &session_failed, &purchased);
+        let (t, _) = candidate.expect("should find MID");
+        assert_eq!(t.symbol, "MID");
+    }
+
+    #[test]
+    fn absorb_with_empty_purchased_returns_cheapest_again() {
+        // Fallback path: with empty purchased set, returns the cheapest affordable
+        let subset = vec![ticker("CHEAP"), ticker("MID")];
+        let quotes = quote_map(&[("CHEAP", 5.0), ("MID", 50.0)]);
+        let session_failed = HashSet::new();
+        let purchased = HashSet::new();
+        let candidate = pick_absorb_candidate(&subset, &quotes, 10.0, &session_failed, &purchased);
+        let (t, _) = candidate.expect("should fall back to CHEAP");
+        assert_eq!(t.symbol, "CHEAP");
+    }
+
+    #[test]
+    fn absorb_returns_none_when_no_cash() {
+        let subset = vec![ticker("ANY")];
+        let quotes = quote_map(&[("ANY", 5.0)]);
+        let session_failed = HashSet::new();
+        let purchased = HashSet::new();
+        let candidate = pick_absorb_candidate(&subset, &quotes, 0.50, &session_failed, &purchased);
+        assert!(candidate.is_none());
     }
 
     #[test]
