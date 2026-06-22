@@ -44,6 +44,8 @@ enum Cmd {
     NotifyTest,
     /// Store a fresh SA cookie (paste cURL or raw cookie string, end with Ctrl+D)
     SetCookie,
+    /// Read iCloud-resident files to trigger TCC permission prompts (run during install)
+    Warmup,
 }
 
 #[tokio::main]
@@ -57,6 +59,7 @@ async fn main() -> Result<()> {
         Cmd::Execute { r#yes, force } => execute_cmd(r#yes, force).await,
         Cmd::NotifyTest => notify_test().await,
         Cmd::SetCookie => set_cookie().await,
+        Cmd::Warmup => warmup().await,
     }
 }
 
@@ -646,6 +649,40 @@ fn save_sa_cookie(env: &config::Env, cookie: &str) {
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         }
     }
+}
+
+async fn warmup() -> Result<()> {
+    let env = config::Env::load()?;
+    eprintln!("Warming up TCC permissions (approve any prompts that appear)...");
+    let paths = iCloud_paths_to_warm(&env);
+    let mut touched = 0;
+    for path in &paths {
+        match std::fs::metadata(path) {
+            Ok(_) => {
+                let _ = std::fs::read(path);
+                eprintln!("  ✓ {}", path.display());
+                touched += 1;
+            }
+            Err(e) => {
+                eprintln!("  - skipped {} ({e})", path.display());
+            }
+        }
+    }
+    eprintln!("Warmup done — touched {} file(s).", touched);
+    eprintln!("If a TCC prompt appeared and you approved, future launchd runs will not re-prompt for this binary.");
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+fn iCloud_paths_to_warm(env: &config::Env) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Some(p) = &env.sa_cookie_path {
+        out.push(resolve_path(p));
+    }
+    if let Ok(tp) = schwab::auth::tokens_path() {
+        out.push(tp);
+    }
+    out
 }
 
 async fn set_cookie() -> Result<()> {

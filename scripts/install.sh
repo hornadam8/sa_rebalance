@@ -12,6 +12,11 @@ echo "Building release binary..."
 echo "Creating log directory at $LOG_DIR"
 mkdir -p "$LOG_DIR"
 
+echo
+echo "Pre-flighting iCloud Drive TCC permission (a macOS prompt may appear — approve it)..."
+(cd "$PROJECT_DIR" && "$PROJECT_DIR/target/release/sa_rebalance" warmup || true)
+echo
+
 echo "Generating plist at $PLIST_DST (substituting __HOME__ and __PROJECT_DIR__)"
 sed -e "s|__PROJECT_DIR__|$PROJECT_DIR|g" -e "s|__HOME__|$HOME|g" "$PLIST_SRC" > "$PLIST_DST"
 
