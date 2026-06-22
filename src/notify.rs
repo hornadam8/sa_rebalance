@@ -26,6 +26,8 @@ pub struct AccountReport {
     pub execution: AccountExecutionReport,
     pub prev_equity: Option<f64>,
     pub prev_ts_unix: Option<i64>,
+    pub post_residual_cash: f64,
+    pub sanity_warning: Option<String>,
 }
 
 impl Report {
@@ -141,9 +143,12 @@ impl Report {
             }
             let _ = writeln!(
                 out,
-                "  Estimated residual cash: ${:.2}",
-                a.plan.estimated_residual_cash
+                "  Post-trade cash: ${:.2}",
+                a.post_residual_cash
             );
+            if let Some(w) = &a.sanity_warning {
+                let _ = writeln!(out, "  WARNING: {w}");
+            }
         }
         out
     }
@@ -306,9 +311,16 @@ impl Report {
 
         let _ = write!(
             s,
-            r#"<div style="margin-top:14px;padding-top:12px;border-top:1px solid #edf2f7;font-size:13px;color:#4a5568;display:flex;justify-content:space-between;">Estimated residual cash: <span style="font-variant-numeric:tabular-nums;font-weight:600;color:#1a202c;">{}</span></div>"#,
-            fmt_money(a.plan.estimated_residual_cash)
+            r#"<div style="margin-top:14px;padding-top:12px;border-top:1px solid #edf2f7;font-size:13px;color:#4a5568;">Post-trade cash: <span style="font-variant-numeric:tabular-nums;font-weight:600;color:#1a202c;">{}</span></div>"#,
+            fmt_money(a.post_residual_cash)
         );
+        if let Some(warning) = &a.sanity_warning {
+            let _ = write!(
+                s,
+                r#"<div style="margin-top:10px;padding:10px 12px;background:#fffaf0;border:1px solid #f6ad55;border-radius:6px;font-size:13px;color:#7b341e;">⚠ {}</div>"#,
+                html_escape(warning)
+            );
+        }
 
         let _ = write!(s, r#"</div></div>"#);
     }
@@ -438,6 +450,30 @@ pub fn write_local(report: &Report) -> Result<PathBuf> {
     let body = format!("{}\n\n{}", report.subject(), report.body_text());
     fs::write(&path, body)?;
     Ok(path)
+}
+
+pub async fn send_failure_email(env: &Env, error: &str) -> Result<()> {
+    let date = now_local()
+        .format(format_description!("[year]-[month]-[day]"))
+        .unwrap_or_default();
+    let body = format!(
+        "sa_rebalance run failed before placing trades:\n\n{error}\n\n\
+         No orders were placed. Check Schwab tokens, SA cookies, and Schwab's status page."
+    );
+    let email = Message::builder()
+        .from(env.gmail_user.parse()?)
+        .to(env.notify_to.parse()?)
+        .subject(format!("FAILURES: SA rebalance — {date} — run aborted"))
+        .header(lettre::message::header::ContentType::TEXT_PLAIN)
+        .body(body)?;
+
+    let creds = Credentials::new(env.gmail_user.clone(), env.gmail_app_password.clone());
+    let mailer: AsyncSmtpTransport<Tokio1Executor> =
+        AsyncSmtpTransport::<Tokio1Executor>::relay("smtp.gmail.com")?
+            .credentials(creds)
+            .build();
+    mailer.send(email).await.context("sending failure email")?;
+    Ok(())
 }
 
 pub async fn send_email(env: &Env, report: &Report) -> Result<()> {

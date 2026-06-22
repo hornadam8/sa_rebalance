@@ -231,12 +231,18 @@ async fn notify_test() -> Result<()> {
             notify::AccountReport {
                 prev_equity: Some(200012.34),
                 prev_ts_unix: Some(notify::now_local().unix_timestamp() - 86400),
+                post_residual_cash: 9.04,
+                sanity_warning: None,
                 plan: big_plan,
                 execution: big_exec,
             },
             notify::AccountReport {
                 prev_equity: Some(8801.50),
                 prev_ts_unix: Some(notify::now_local().unix_timestamp() - 86400),
+                post_residual_cash: 1230.45,
+                sanity_warning: Some(
+                    "Post-trade cash $1230.45 exceeds ~one position size ($459.76). Rebalance likely incomplete — see failures above.".into()
+                ),
                 plan: small_plan,
                 execution: small_exec,
             },
@@ -252,14 +258,26 @@ async fn notify_test() -> Result<()> {
 }
 
 async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
-    use std::collections::HashSet;
-
     if !yes {
         eprintln!("`execute` will place real orders. Pass --yes to confirm.");
         std::process::exit(2);
     }
 
     let env = config::Env::load()?;
+    let result = execute_cmd_inner(&env, force).await;
+    if let Err(e) = &result {
+        let msg = format!("{e:#}");
+        eprintln!("Run failed: {msg}");
+        if let Err(send_err) = notify::send_failure_email(&env, &msg).await {
+            eprintln!("Also failed to send failure email: {send_err:#}");
+        }
+    }
+    result
+}
+
+async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
+    use std::collections::HashSet;
+
     let allowlist: HashSet<String> = env.schwab_rebalance_accounts.iter().cloned().collect();
     if allowlist.is_empty() {
         anyhow::bail!("SCHWAB_REBALANCE_ACCOUNTS is empty");
@@ -271,11 +289,13 @@ async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
     if rotated != cookie {
         save_sa_cookie(&env, &rotated);
     }
-    let top_20: Vec<sa::Ticker> = raw_sa
+    let filtered_sa: Vec<sa::Ticker> = raw_sa
         .into_iter()
         .filter(|t| !blocklist.contains(&t.symbol.to_ascii_uppercase()))
-        .take(20)
         .collect();
+    let split_at = 20.min(filtered_sa.len());
+    let top_20: Vec<sa::Ticker> = filtered_sa[..split_at].to_vec();
+    let spares: Vec<sa::Ticker> = filtered_sa[split_at..].to_vec();
 
     let client = schwab::trader::Client::new(&env).await?;
 
@@ -288,6 +308,9 @@ async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
     let accounts = schwab::trader::parse_accounts(&numbers, &accounts_raw)?;
 
     let mut symbol_set: HashSet<String> = top_20.iter().map(|t| t.symbol.clone()).collect();
+    for t in &spares {
+        symbol_set.insert(t.symbol.clone());
+    }
     for acc in &accounts {
         if !allowlist.contains(&acc.account_number) {
             continue;
@@ -297,7 +320,20 @@ async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
         }
     }
     let symbols: Vec<String> = symbol_set.into_iter().collect();
-    let prices = client.quotes(&symbols).await?;
+    let quotes_map = client.quotes(&symbols).await?;
+    let prices: std::collections::HashMap<String, f64> = quotes_map
+        .iter()
+        .map(|(k, q)| (k.clone(), q.price()))
+        .collect();
+
+    let mut exchanges: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for t in &top_20 {
+        exchanges.insert(t.symbol.clone(), t.exchange.clone());
+    }
+    for t in &spares {
+        exchanges.insert(t.symbol.clone(), t.exchange.clone());
+    }
 
     let plans: Vec<rebalance::AccountPlan> = accounts
         .iter()
@@ -307,7 +343,7 @@ async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
 
     let days_remaining = client.days_until_reauth();
     println!("Schwab re-auth in {} days", days_remaining);
-    let exec_reports = execute::run_execute(&client, &plans).await?;
+    let exec_reports = execute::run_execute(&client, &plans, &spares, &quotes_map, &exchanges).await?;
 
     let prev_snapshots = history::load();
     let mut new_snapshots = prev_snapshots.clone();
@@ -321,9 +357,13 @@ async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
         .zip(exec_reports.into_iter())
         .map(|(plan, execution)| {
             let prev = prev_snapshots.get(&plan.account_number);
+            let post_residual = execute::compute_residual_cash(&plan, &execution);
+            let warning = execute::sanity_warning(&plan, post_residual);
             let report = notify::AccountReport {
                 prev_equity: prev.map(|p| p.equity),
                 prev_ts_unix: prev.map(|p| p.unix_ts),
+                post_residual_cash: post_residual,
+                sanity_warning: warning,
                 plan: plan.clone(),
                 execution,
             };
@@ -397,7 +437,11 @@ async fn plan() -> Result<()> {
         }
     }
     let symbols: Vec<String> = symbol_set.into_iter().collect();
-    let prices = client.quotes(&symbols).await?;
+    let quotes_map = client.quotes(&symbols).await?;
+    let prices: std::collections::HashMap<String, f64> = quotes_map
+        .iter()
+        .map(|(k, q)| (k.clone(), q.price()))
+        .collect();
 
     println!("Top 20 used:");
     for (i, t) in top_20.iter().enumerate() {

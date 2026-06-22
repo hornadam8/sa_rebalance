@@ -187,7 +187,7 @@ impl Client {
         }
     }
 
-    pub async fn quotes(&self, symbols: &[String]) -> Result<HashMap<String, f64>> {
+    pub async fn quotes(&self, symbols: &[String]) -> Result<HashMap<String, Quote>> {
         if symbols.is_empty() {
             return Ok(HashMap::new());
         }
@@ -201,24 +201,105 @@ impl Client {
             .context("quotes response is not an object")?;
         let mut out = HashMap::new();
         for (sym, body) in obj {
-            if let Some(price) = extract_price(body) {
-                out.insert(sym.clone(), price);
+            if let Some(q) = extract_quote(body) {
+                out.insert(sym.clone(), q);
             }
         }
         Ok(out)
     }
+
+    pub async fn place_limit_order(
+        &self,
+        account_hash: &str,
+        symbol: &str,
+        instruction: &str,
+        quantity: u32,
+        limit_price: f64,
+    ) -> Result<String> {
+        let body = serde_json::json!({
+            "orderType": "LIMIT",
+            "session": "NORMAL",
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "price": format!("{:.4}", limit_price),
+            "orderLegCollection": [{
+                "instruction": instruction,
+                "quantity": quantity,
+                "instrument": {
+                    "symbol": symbol,
+                    "assetType": "EQUITY",
+                }
+            }]
+        });
+        let url = format!("{TRADER_BASE}/accounts/{account_hash}/orders");
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.tokens.access_token)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "place limit {} {} {} @ {} returned {}: {}",
+                instruction,
+                quantity,
+                symbol,
+                limit_price,
+                status,
+                body
+            );
+        }
+        let location = resp
+            .headers()
+            .get("Location")
+            .and_then(|v| v.to_str().ok())
+            .context("missing Location header on order placement")?;
+        Ok(location
+            .rsplit('/')
+            .next()
+            .context("malformed Location header")?
+            .to_string())
+    }
 }
 
-fn extract_price(body: &Value) -> Option<f64> {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Quote {
+    pub bid: f64,
+    pub ask: f64,
+    pub mark: f64,
+}
+
+impl Quote {
+    pub fn price(&self) -> f64 {
+        if self.mark > 0.0 {
+            self.mark
+        } else if self.bid > 0.0 && self.ask > 0.0 {
+            (self.bid + self.ask) / 2.0
+        } else if self.ask > 0.0 {
+            self.ask
+        } else if self.bid > 0.0 {
+            self.bid
+        } else {
+            0.0
+        }
+    }
+}
+
+fn extract_quote(body: &Value) -> Option<Quote> {
     let q = body.get("quote")?;
-    q.get("mark")
-        .and_then(Value::as_f64)
+    let mark = q.get("mark").and_then(Value::as_f64)
         .or_else(|| q.get("lastPrice").and_then(Value::as_f64))
-        .or_else(|| {
-            let bid = q.get("bidPrice").and_then(Value::as_f64)?;
-            let ask = q.get("askPrice").and_then(Value::as_f64)?;
-            Some((bid + ask) / 2.0)
-        })
+        .unwrap_or(0.0);
+    let bid = q.get("bidPrice").and_then(Value::as_f64).unwrap_or(0.0);
+    let ask = q.get("askPrice").and_then(Value::as_f64).unwrap_or(0.0);
+    if mark <= 0.0 && bid <= 0.0 && ask <= 0.0 {
+        return None;
+    }
+    Some(Quote { bid, ask, mark })
 }
 
 pub fn parse_accounts(numbers: &Value, accounts: &Value) -> Result<Vec<Account>> {
