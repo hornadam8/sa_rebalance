@@ -193,9 +193,6 @@ fn allocate_shares(
             }
             let current_value = *alloc.get(&t.symbol).unwrap() as f64 * p;
             let underflow = target - current_value;
-            if 2.0 * underflow <= p {
-                continue;
-            }
             let score = p * (2.0 * underflow - p);
             match &best {
                 None => best = Some((t.symbol.clone(), p, score)),
