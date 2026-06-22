@@ -341,6 +341,7 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
 
     let prev_snapshots = history::load();
     let mut new_snapshots = prev_snapshots.clone();
+    let today = today_local_str();
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -350,7 +351,7 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
         .into_iter()
         .zip(exec_reports.into_iter())
         .map(|(plan, execution)| {
-            let prev = prev_snapshots.get(&plan.account_number);
+            let prev = history::most_recent_prior(&prev_snapshots, &plan.account_number, &today);
             let post_residual = execute::compute_residual_cash(&plan, &execution);
             let warning = execute::sanity_warning(&plan, post_residual);
             let report = notify::AccountReport {
@@ -361,8 +362,10 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
                 plan: plan.clone(),
                 execution,
             };
-            new_snapshots.insert(
+            history::record_today(
+                &mut new_snapshots,
                 plan.account_number.clone(),
+                today.clone(),
                 history::Snapshot {
                     equity: plan.equity,
                     unix_ts: now_unix,
