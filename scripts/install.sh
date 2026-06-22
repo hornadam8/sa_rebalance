@@ -22,7 +22,7 @@ echo "Loading job..."
 launchctl load "$PLIST_DST"
 
 echo
-echo "Installed. Will run weekdays at 7:30 MT (= 9:30 ET)."
+echo "Installed. Will run weekdays at 7:30, 9:30, 11:30, 13:30 MT."
 echo "To verify: launchctl list | grep sa_rebalance"
 echo "To uninstall: launchctl unload $PLIST_DST && rm $PLIST_DST"
 echo "Logs: $LOG_DIR/launchd.out.log, $LOG_DIR/launchd.err.log"

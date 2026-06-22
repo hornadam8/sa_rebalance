@@ -401,16 +401,7 @@ async fn plan() -> Result<()> {
     }
 
     let blocklist = config::load_blocklist(&config::blocklist_path())?;
-    let cookie = load_sa_cookie(&env);
-    let (raw_sa, rotated) = sa::fetch_top_rated(&cookie).await?;
-    if rotated != cookie {
-        save_sa_cookie(&env, &rotated);
-    }
-    let top_20: Vec<sa::Ticker> = raw_sa
-        .into_iter()
-        .filter(|t| !blocklist.contains(&t.symbol.to_ascii_uppercase()))
-        .take(20)
-        .collect();
+    let (top_20, _spares) = get_or_fetch_top_lists(&env, &blocklist).await?;
 
     let client = schwab::trader::Client::new(&env).await?;
     let numbers = client.account_numbers_raw().await?;
