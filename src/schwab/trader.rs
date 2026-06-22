@@ -13,6 +13,10 @@ pub struct Client {
     tokens: Tokens,
     client_id: String,
     client_secret: String,
+    trader_base: String,
+    marketdata_base: String,
+    token_url: String,
+    refresh_retry_delay: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -40,6 +44,10 @@ impl Client {
             tokens: auth::load_tokens()?,
             client_id: env.schwab_client_id.clone(),
             client_secret: env.schwab_client_secret.clone(),
+            trader_base: TRADER_BASE.to_string(),
+            marketdata_base: MARKETDATA_BASE.to_string(),
+            token_url: auth::TOKEN_URL.to_string(),
+            refresh_retry_delay: std::time::Duration::from_secs(300),
         };
         c.ensure_fresh().await?;
         Ok(c)
@@ -57,13 +65,20 @@ impl Client {
         for attempt in 0..2u32 {
             if attempt > 0 {
                 eprintln!(
-                    "token refresh attempt {} failed, sleeping 300s and retrying once...",
-                    attempt
+                    "token refresh attempt {} failed, sleeping {}s and retrying once...",
+                    attempt,
+                    self.refresh_retry_delay.as_secs()
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                tokio::time::sleep(self.refresh_retry_delay).await;
             }
-            match auth::refresh(&self.http, &self.client_id, &self.client_secret, &self.tokens)
-                .await
+            match auth::refresh(
+                &self.http,
+                &self.client_id,
+                &self.client_secret,
+                &self.token_url,
+                &self.tokens,
+            )
+            .await
             {
                 Ok(refreshed) => {
                     auth::save_tokens(&refreshed)?;
@@ -98,17 +113,17 @@ impl Client {
     }
 
     pub async fn account_numbers_raw(&self) -> Result<Value> {
-        self.get_url(&format!("{TRADER_BASE}/accounts/accountNumbers"))
+        self.get_url(&format!("{}/accounts/accountNumbers", self.trader_base))
             .await
     }
 
     pub async fn accounts_with_positions_raw(&self) -> Result<Value> {
-        self.get_url(&format!("{TRADER_BASE}/accounts?fields=positions"))
+        self.get_url(&format!("{}/accounts?fields=positions", self.trader_base))
             .await
     }
 
     pub async fn is_equity_market_open(&self) -> Result<bool> {
-        let url = format!("{MARKETDATA_BASE}/markets?markets=equity");
+        let url = format!("{}/markets?markets=equity", self.marketdata_base);
         let json = self.get_url(&url).await?;
         let equity = json.get("equity").context("no equity in markets response")?;
         for (_key, market) in equity.as_object().context("equity is not object")? {
@@ -144,7 +159,7 @@ impl Client {
                 }
             }]
         });
-        let url = format!("{TRADER_BASE}/accounts/{account_hash}/orders");
+        let url = format!("{}/accounts/{account_hash}/orders", self.trader_base);
         let resp = self
             .http
             .post(&url)
@@ -172,7 +187,7 @@ impl Client {
     }
 
     pub async fn get_order(&self, account_hash: &str, order_id: &str) -> Result<Value> {
-        let url = format!("{TRADER_BASE}/accounts/{account_hash}/orders/{order_id}");
+        let url = format!("{}/accounts/{account_hash}/orders/{order_id}", self.trader_base);
         self.get_url(&url).await
     }
 
@@ -208,7 +223,8 @@ impl Client {
             return Ok(HashMap::new());
         }
         let url = format!(
-            "{MARKETDATA_BASE}/quotes?symbols={}&fields=quote",
+            "{}/quotes?symbols={}&fields=quote",
+            self.marketdata_base,
             symbols.join(","),
         );
         let json = self.get_url(&url).await?;
@@ -247,7 +263,7 @@ impl Client {
                 }
             }]
         });
-        let url = format!("{TRADER_BASE}/accounts/{account_hash}/orders");
+        let url = format!("{}/accounts/{account_hash}/orders", self.trader_base);
         let resp = self
             .http
             .post(&url)
@@ -495,6 +511,284 @@ mod tests {
         let parsed = parse_accounts(&numbers, &accounts).expect("should parse");
         assert_eq!(parsed[0].positions.len(), 1);
         assert_eq!(parsed[0].positions[0].symbol, "AAPL");
+    }
+
+    fn test_tokens_valid() -> Tokens {
+        Tokens {
+            access_token: "valid_access".into(),
+            refresh_token: "valid_refresh".into(),
+            access_expires_at: u64::MAX,
+            refresh_expires_at: u64::MAX,
+        }
+    }
+
+    fn test_tokens_expired_access() -> Tokens {
+        Tokens {
+            access_token: "expired_access".into(),
+            refresh_token: "valid_refresh".into(),
+            access_expires_at: 1,
+            refresh_expires_at: u64::MAX,
+        }
+    }
+
+    fn test_client(server_uri: &str, tokens: Tokens) -> Client {
+        Client {
+            http: reqwest::Client::new(),
+            tokens,
+            client_id: "test_id".into(),
+            client_secret: "test_secret".into(),
+            trader_base: format!("{}/trader/v1", server_uri),
+            marketdata_base: format!("{}/marketdata/v1", server_uri),
+            token_url: format!("{}/v1/oauth/token", server_uri),
+            refresh_retry_delay: std::time::Duration::from_millis(5),
+        }
+    }
+
+    fn point_tokens_path_at_tempfile() {
+        std::env::set_var("TOKENS_PATH", "/tmp/sa_rebalance_http_test_tokens.json");
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_retries_after_transient_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        point_tokens_path_at_tempfile();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("transient"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "fresh_access",
+                "refresh_token": "fresh_refresh",
+                "expires_in": 1800,
+                "refresh_token_expires_in": 604800,
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server.uri(), test_tokens_expired_access());
+        client.ensure_fresh().await.expect("should succeed via retry");
+        assert_eq!(client.tokens.access_token, "fresh_access");
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_bails_when_both_attempts_fail() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        point_tokens_path_at_tempfile();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/token"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
+            .mount(&server)
+            .await;
+
+        let mut client = test_client(&server.uri(), test_tokens_expired_access());
+        let result = client.ensure_fresh().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_no_refresh_when_access_still_valid() {
+        use wiremock::MockServer;
+
+        point_tokens_path_at_tempfile();
+        let server = MockServer::start().await;
+
+        let mut client = test_client(&server.uri(), test_tokens_valid());
+        let original_access = client.tokens.access_token.clone();
+        client.ensure_fresh().await.expect("no-op should succeed");
+        assert_eq!(client.tokens.access_token, original_access);
+    }
+
+    #[tokio::test]
+    async fn quotes_parses_multi_symbol_response() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/marketdata/v1/quotes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "AAPL": {"quote": {"bidPrice": 150.0, "askPrice": 151.0, "mark": 150.5}},
+                "MSFT": {"quote": {"lastPrice": 300.0}}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let q = client.quotes(&["AAPL".into(), "MSFT".into()]).await.unwrap();
+        assert_eq!(q["AAPL"].mark, 150.5);
+        assert_eq!(q["AAPL"].ask, 151.0);
+        assert_eq!(q["MSFT"].mark, 300.0);
+    }
+
+    #[tokio::test]
+    async fn place_market_order_extracts_order_id_from_location() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/trader/v1/accounts/HASH/orders"))
+            .respond_with(
+                ResponseTemplate::new(201).insert_header(
+                    "Location",
+                    "https://api.schwabapi.com/trader/v1/accounts/HASH/orders/1234567890",
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let id = client
+            .place_market_order("HASH", "AAPL", "BUY", 10)
+            .await
+            .unwrap();
+        assert_eq!(id, "1234567890");
+    }
+
+    #[tokio::test]
+    async fn place_market_order_propagates_schwab_rejection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/trader/v1/accounts/HASH/orders"))
+            .respond_with(ResponseTemplate::new(422).set_body_string("symbol restricted"))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let result = client.place_market_order("HASH", "SHIP", "BUY", 10).await;
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("422"), "expected 422 in error: {msg}");
+        assert!(msg.contains("symbol restricted"));
+    }
+
+    #[tokio::test]
+    async fn place_limit_order_sends_limit_type_and_price() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/trader/v1/accounts/HASH/orders"))
+            .respond_with(
+                ResponseTemplate::new(201).insert_header("Location", "/orders/777"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let id = client
+            .place_limit_order("HASH", "OTCSYM", "BUY", 5, 45.67)
+            .await
+            .unwrap();
+        assert_eq!(id, "777");
+
+        let recorded = server.received_requests().await.expect("requests recorded");
+        let body: serde_json::Value =
+            serde_json::from_slice(&recorded[0].body).expect("json body");
+        assert_eq!(body["orderType"], "LIMIT");
+        assert_eq!(body["price"], "45.6700");
+        assert_eq!(body["orderLegCollection"][0]["instruction"], "BUY");
+        assert_eq!(body["orderLegCollection"][0]["quantity"], 5);
+    }
+
+    #[tokio::test]
+    async fn is_equity_market_open_returns_false_when_closed() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/marketdata/v1/markets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "equity": {"EQ": {"isOpen": false}}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        assert!(!client.is_equity_market_open().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_equity_market_open_returns_true_when_any_sub_market_open() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/marketdata/v1/markets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "equity": {"EQ": {"isOpen": true}}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        assert!(client.is_equity_market_open().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn await_filled_returns_on_filled_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/trader/v1/accounts/HASH/orders/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "FILLED",
+                "filledQuantity": 10,
+                "orderActivityCollection": [{
+                    "executionLegs": [{"quantity": 10, "price": 150.25}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let order = client
+            .await_filled("HASH", "42", std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(order["status"], "FILLED");
+    }
+
+    #[tokio::test]
+    async fn await_filled_bails_on_rejected_status() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/trader/v1/accounts/HASH/orders/99"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "REJECTED"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let result = client
+            .await_filled("HASH", "99", std::time::Duration::from_secs(1))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("REJECTED"));
     }
 
     #[test]

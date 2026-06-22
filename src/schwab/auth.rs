@@ -68,10 +68,11 @@ pub(crate) async fn refresh(
     http: &reqwest::Client,
     client_id: &str,
     client_secret: &str,
+    token_url: &str,
     current: &Tokens,
 ) -> Result<Tokens> {
     let resp = http
-        .post(TOKEN_URL)
+        .post(token_url)
         .basic_auth(client_id, Some(client_secret))
         .form(&[
             ("grant_type", "refresh_token"),
@@ -142,6 +143,7 @@ pub async fn run_auth_flow(
             ("code", &code),
             ("redirect_uri", redirect_uri),
         ])
+
         .send()
         .await
         .context("posting to Schwab token endpoint")?;
