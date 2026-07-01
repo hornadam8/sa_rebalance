@@ -191,6 +191,50 @@ impl Client {
         self.get_url(&url).await
     }
 
+    pub async fn cancel_order(&self, account_hash: &str, order_id: &str) -> Result<()> {
+        let url = format!("{}/accounts/{account_hash}/orders/{order_id}", self.trader_base);
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(&self.tokens.access_token)
+            .send()
+            .await
+            .with_context(|| format!("DELETE order {order_id}"))?;
+        let status = resp.status();
+        // 404 means it already completed (filled or already cancelled) — treat as ok
+        if !status.is_success() && status.as_u16() != 404 {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("cancel order {order_id} returned {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// Cancel a live order and check whether it managed to fill before the cancel landed.
+    /// Returns `Some(order)` if the order filled (record as a fill),
+    /// or `None` if it was cancelled (buying power freed).
+    pub async fn cancel_and_check(
+        &self,
+        account_hash: &str,
+        order_id: &str,
+    ) -> Result<Option<Value>> {
+        // Best-effort cancel; ignore errors (order may already be terminal)
+        let _ = self.cancel_order(account_hash, order_id).await;
+        // Give Schwab time to process the cancel
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let order = self.get_order(account_hash, order_id).await?;
+        let status = order
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("UNKNOWN");
+        if status == "FILLED" || status == "PARTIALLY_FILLED" {
+            // Raced to a fill (full or partial) just before the cancel — record whatever filled
+            Ok(Some(order))
+        } else {
+            // Cancelled/expired/rejected — buying power freed
+            Ok(None)
+        }
+    }
+
     pub async fn await_filled(
         &self,
         account_hash: &str,
@@ -864,6 +908,87 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("REJECTED"));
+    }
+
+    // --- cancel_and_check tests ---
+    // Helper: build a mock server with a DELETE endpoint for cancel and a GET endpoint for order status.
+    async fn cancel_and_check_server(
+        order_id: &str,
+        order_json: serde_json::Value,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // DELETE — cancel succeeds
+        Mock::given(method("DELETE"))
+            .and(path(format!("/trader/v1/accounts/HASH/orders/{order_id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        // GET — return the provided order state
+        Mock::given(method("GET"))
+            .and(path(format!("/trader/v1/accounts/HASH/orders/{order_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(order_json))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn cancel_and_check_returns_some_when_filled() {
+        let server = cancel_and_check_server(
+            "99",
+            serde_json::json!({
+                "status": "FILLED",
+                "filledQuantity": 170,
+                "orderActivityCollection": [{
+                    "executionLegs": [{"quantity": 170, "price": 58.85}]
+                }]
+            }),
+        )
+        .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let result = client.cancel_and_check("HASH", "99").await.unwrap();
+        assert!(result.is_some(), "FILLED order should return Some(order)");
+        assert_eq!(result.unwrap()["status"], "FILLED");
+    }
+
+    #[tokio::test]
+    async fn cancel_and_check_returns_some_when_partially_filled() {
+        // This is the LNVGY scenario: 19 of 170 shares filled before the cancel landed.
+        let server = cancel_and_check_server(
+            "100",
+            serde_json::json!({
+                "status": "PARTIALLY_FILLED",
+                "filledQuantity": 19,
+                "orderActivityCollection": [{
+                    "executionLegs": [{"quantity": 19, "price": 58.85}]
+                }]
+            }),
+        )
+        .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let result = client.cancel_and_check("HASH", "100").await.unwrap();
+        assert!(result.is_some(), "PARTIALLY_FILLED order should return Some(order)");
+        let order = result.unwrap();
+        assert_eq!(order["status"], "PARTIALLY_FILLED");
+        assert_eq!(order["filledQuantity"], 19);
+    }
+
+    #[tokio::test]
+    async fn cancel_and_check_returns_none_when_cancelled() {
+        let server = cancel_and_check_server(
+            "101",
+            serde_json::json!({"status": "CANCELED"}),
+        )
+        .await;
+
+        let client = test_client(&server.uri(), test_tokens_valid());
+        let result = client.cancel_and_check("HASH", "101").await.unwrap();
+        assert!(result.is_none(), "CANCELED order should return None");
     }
 
     #[test]

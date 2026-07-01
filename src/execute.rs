@@ -117,6 +117,38 @@ async fn place_and_collect(
                     avg_price: price,
                 });
             }
+            Err(e) if e.to_string().contains("timed out") => {
+                // Order is still live at Schwab — cancel it so buying power is freed
+                // before substitution/absorb attempt to use it.
+                eprintln!("[{}] order {order_id} timed out — cancelling to free buying power", trade.symbol);
+                match client.cancel_and_check(account_hash, &order_id).await {
+                    Ok(Some(order)) => {
+                        // Filled in the race window between timeout and cancel
+                        eprintln!("[{}] order {order_id} filled before cancel landed — recording fill", trade.symbol);
+                        let (qty, price) = extract_fill(&order);
+                        report.fills.push(Fill {
+                            trade,
+                            filled_quantity: qty,
+                            avg_price: price,
+                        });
+                    }
+                    Ok(None) => {
+                        // Cleanly cancelled; buying power freed
+                        report.failures.push(OrderFailure {
+                            trade,
+                            reason: format!("timed out and cancelled: {e}"),
+                        });
+                    }
+                    Err(cancel_err) => {
+                        // Cancel attempt failed — buying power may still be reserved
+                        eprintln!("[{}] cancel of {order_id} failed: {cancel_err}", trade.symbol);
+                        report.failures.push(OrderFailure {
+                            trade,
+                            reason: format!("timed out ({e}); cancel also failed: {cancel_err}"),
+                        });
+                    }
+                }
+            }
             Err(e) => report.failures.push(OrderFailure {
                 trade,
                 reason: e.to_string(),
@@ -220,10 +252,14 @@ async fn absorb_residual_cash(
         };
         let quote = quotes.get(&ticker.symbol).expect("just looked up");
 
+        let shares = (cash / price).floor() as u32;
+        if shares == 0 {
+            break;
+        }
         let trade = Trade {
             symbol: ticker.symbol.clone(),
             side: Side::Buy,
-            shares: 1,
+            shares,
             indicative_price: price,
         };
         let ex = exchanges.get(&ticker.symbol).map(String::as_str);
@@ -232,7 +268,7 @@ async fn absorb_residual_cash(
             &plan.account_hash,
             &ticker.symbol,
             Side::Buy,
-            1,
+            shares,
             Some(quote),
             ex,
         )

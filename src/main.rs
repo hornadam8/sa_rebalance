@@ -231,7 +231,8 @@ async fn notify_test() -> Result<()> {
         .into_iter()
         .map(String::from)
         .collect(),
-        blocked: vec!["SHIP".into()],
+        blocked: vec!["SHIP".into(), "PBR.A".into()],
+        promoted: vec![("PBR.A".into(), "JAZZ".into())],
         accounts: vec![
             notify::AccountReport {
                 prev_equity: Some(200012.34),
@@ -280,6 +281,48 @@ async fn execute_cmd(yes: bool, force: bool) -> Result<()> {
     result
 }
 
+/// Replace any top-20 slots with no Schwab quote with the next quoted spare.
+/// Returns (updated_top, remaining_spares, swaps) where swaps is (dropped, replacement).
+fn promote_missing(
+    top_20: &[sa::Ticker],
+    spares: &[sa::Ticker],
+    prices: &std::collections::HashMap<String, f64>,
+) -> (Vec<sa::Ticker>, Vec<sa::Ticker>, Vec<(String, String)>) {
+    let mut effective = top_20.to_vec();
+    let mut promoted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut swaps: Vec<(String, String)> = Vec::new();
+    let mut spare_iter = spares.iter();
+
+    for slot in effective.iter_mut() {
+        if prices.get(&slot.symbol).copied().unwrap_or(0.0) > 0.0 {
+            continue;
+        }
+        // Advance through spares to find the next one with a valid quote.
+        loop {
+            match spare_iter.next() {
+                None => break,
+                Some(spare) => {
+                    if prices.get(&spare.symbol).copied().unwrap_or(0.0) > 0.0 {
+                        swaps.push((slot.symbol.clone(), spare.symbol.clone()));
+                        promoted.insert(spare.symbol.clone());
+                        *slot = spare.clone();
+                        break;
+                    }
+                    // spare also has no quote; skip it
+                }
+            }
+        }
+    }
+
+    let remaining_spares: Vec<sa::Ticker> = spares
+        .iter()
+        .filter(|s| !promoted.contains(&s.symbol))
+        .cloned()
+        .collect();
+
+    (effective, remaining_spares, swaps)
+}
+
 async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
     use std::collections::HashSet;
 
@@ -320,6 +363,10 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
         .map(|(k, q)| (k.clone(), q.price()))
         .collect();
 
+    // Promote quoted spares to fill any top-20 slots that have no Schwab quote.
+    let (effective_top, effective_spares, promotions) =
+        promote_missing(&top_20, &spares, &prices);
+
     let mut exchanges: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for t in &top_20 {
@@ -332,12 +379,12 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
     let plans: Vec<rebalance::AccountPlan> = accounts
         .iter()
         .filter(|a| allowlist.contains(&a.account_number))
-        .map(|a| rebalance::plan_account(a, &top_20, &prices))
+        .map(|a| rebalance::plan_account(a, &effective_top, &prices))
         .collect();
 
     let days_remaining = client.days_until_reauth();
     println!("Schwab re-auth in {} days", days_remaining);
-    let exec_reports = execute::run_execute(&client, &plans, &top_20, &spares, &quotes_map, &exchanges).await?;
+    let exec_reports = execute::run_execute(&client, &plans, &effective_top, &effective_spares, &quotes_map, &exchanges).await?;
 
     let prev_snapshots = history::load();
     let mut new_snapshots = prev_snapshots.clone();
@@ -381,8 +428,9 @@ async fn execute_cmd_inner(env: &config::Env, force: bool) -> Result<()> {
         run_at: notify::now_local(),
         schwab_days_remaining: days_remaining,
         sa_cookie_age_days: sa_cookie_age_days(&env),
-        top_used: top_20.iter().map(|t| t.symbol.clone()).collect(),
+        top_used: effective_top.iter().map(|t| t.symbol.clone()).collect(),
         blocked,
+        promoted: promotions,
         accounts: account_reports,
     };
 
@@ -407,7 +455,7 @@ async fn plan() -> Result<()> {
     }
 
     let blocklist = config::load_blocklist(&config::blocklist_path())?;
-    let (top_20, _spares) = get_or_fetch_top_lists(&env, &blocklist).await?;
+    let (top_20, spares) = get_or_fetch_top_lists(&env, &blocklist).await?;
 
     let client = schwab::trader::Client::new(&env).await?;
     let numbers = client.account_numbers_raw().await?;
@@ -415,7 +463,7 @@ async fn plan() -> Result<()> {
     let accounts = schwab::trader::parse_accounts(&numbers, &accounts_raw)?;
 
     let mut symbol_set: HashSet<String> =
-        top_20.iter().map(|t| t.symbol.clone()).collect();
+        top_20.iter().chain(spares.iter()).map(|t| t.symbol.clone()).collect();
     for acc in &accounts {
         if !allowlist.contains(&acc.account_number) {
             continue;
@@ -431,10 +479,16 @@ async fn plan() -> Result<()> {
         .map(|(k, q)| (k.clone(), q.price()))
         .collect();
 
+    let (effective_top, _effective_spares, promotions) =
+        promote_missing(&top_20, &spares, &prices);
+
     println!("Top 20 used:");
-    for (i, t) in top_20.iter().enumerate() {
+    for (i, t) in effective_top.iter().enumerate() {
         let px = prices.get(&t.symbol).copied().unwrap_or(0.0);
         println!("  {:>2}. {:<8} ${:>8.2}", i + 1, t.symbol, px);
+    }
+    for (dropped, replacement) in &promotions {
+        println!("  [promoted] {replacement} replaces {dropped} (no quote)");
     }
     println!("\nSchwab re-auth in {} days\n", client.days_until_reauth());
 
@@ -442,7 +496,7 @@ async fn plan() -> Result<()> {
         if !allowlist.contains(&acc.account_number) {
             continue;
         }
-        let plan = rebalance::plan_account(acc, &top_20, &prices);
+        let plan = rebalance::plan_account(acc, &effective_top, &prices);
         print_plan(&plan);
     }
     Ok(())

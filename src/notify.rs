@@ -18,6 +18,8 @@ pub struct Report {
     pub sa_cookie_age_days: Option<i64>,
     pub top_used: Vec<String>,
     pub blocked: Vec<String>,
+    /// Spares promoted to fill top-20 slots that had no Schwab quote: (dropped_symbol, replacement_symbol)
+    pub promoted: Vec<(String, String)>,
     pub accounts: Vec<AccountReport>,
 }
 
@@ -81,6 +83,12 @@ impl Report {
         if !self.blocked.is_empty() {
             let _ = writeln!(out, "Blocked (skipped from list): {}", self.blocked.join(", "));
         }
+        for (dropped, replacement) in &self.promoted {
+            let _ = writeln!(
+                out,
+                "Promoted: {replacement} replaces {dropped} (no Schwab quote)"
+            );
+        }
         for a in &self.accounts {
             let _ = writeln!(out);
             let _ = writeln!(
@@ -98,6 +106,13 @@ impl Report {
                     out,
                     "  skipped (won't fit): {}",
                     a.plan.skipped_unaffordable.join(", ")
+                );
+            }
+            if !a.plan.missing_quotes.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  no quote (excluded): {}",
+                    a.plan.missing_quotes.join(", ")
                 );
             }
             let (sells, buys): (Vec<_>, Vec<_>) = a
@@ -232,6 +247,9 @@ impl Report {
         if !self.blocked.is_empty() {
             let _ = write!(s, r#"<div style="margin-top:10px;font-size:13px;color:#718096;">Blocked: <span style="font-family:Menlo,Consolas,monospace;color:#c53030;">{}</span></div>"#, self.blocked.join(", "));
         }
+        for (dropped, replacement) in &self.promoted {
+            let _ = write!(s, r#"<div style="margin-top:6px;font-size:13px;color:#718096;">Promoted: <span style="font-family:Menlo,Consolas,monospace;color:#2f855a;font-weight:600;">{replacement}</span> replaces <span style="font-family:Menlo,Consolas,monospace;color:#c53030;">{dropped}</span> (no Schwab quote)</div>"#);
+        }
 
         for a in &self.accounts {
             self.append_account_html(&mut s, a);
@@ -288,6 +306,9 @@ impl Report {
         let _ = write!(s, r#"</tr></table>"#);
         if !a.plan.skipped_unaffordable.is_empty() {
             let _ = write!(s, r#"<div style="margin-top:10px;font-size:13px;color:#718096;">Skipped (won't fit): <span style="font-family:Menlo,Consolas,monospace;color:#4a5568;">{}</span></div>"#, a.plan.skipped_unaffordable.join(", "));
+        }
+        if !a.plan.missing_quotes.is_empty() {
+            let _ = write!(s, r#"<div style="margin-top:6px;font-size:13px;color:#718096;">No quote (excluded): <span style="font-family:Menlo,Consolas,monospace;color:#c53030;">{}</span></div>"#, a.plan.missing_quotes.join(", "));
         }
         let _ = write!(s, r#"</div>"#);
 

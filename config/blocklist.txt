@@ -2,3 +2,4 @@
 # One ticker per line. Comments start with '#'. The execute step appends to this file
 # automatically when an order is rejected.
 SHIP
+PBR.A
